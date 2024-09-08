@@ -20,6 +20,13 @@ const (
 	maxHistorySize  = 1000
 )
 
+type Job struct {
+	cmd      *exec.Cmd
+	status   string
+	jobID    int
+	stopChan chan struct{}
+}
+
 type Shell struct {
 	history        []string
 	historyFile    string
@@ -27,6 +34,10 @@ type Shell struct {
 	signalChan     chan os.Signal
 	interruptCount int
 	env            map[string]string
+	aliases        map[string]string
+	jobs           map[int]*Job
+	nextJobID      int
+	variables      map[string]string
 }
 
 func NewShell() (*Shell, error) {
@@ -52,15 +63,21 @@ func NewShell() (*Shell, error) {
 		currentDir:  currentDir,
 		signalChan:  make(chan os.Signal, 1),
 		env:         make(map[string]string),
+		aliases:     make(map[string]string),
+		jobs:        make(map[int]*Job),
+		nextJobID:   1,
+		variables:   make(map[string]string),
 	}, nil
 }
 
 func (s *Shell) Run() {
-	signal.Notify(s.signalChan, syscall.SIGINT)
+	signal.Notify(s.signalChan, syscall.SIGINT, syscall.SIGTSTP, syscall.SIGCHLD)
 	defer signal.Stop(s.signalChan)
 
+	go s.handleSignals()
+
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:      fmt.Sprintf("%s $ ", s.currentDir),
+		Prompt:      s.getPrompt(),
 		HistoryFile: s.historyFile,
 	})
 	if err != nil {
@@ -92,13 +109,22 @@ func (s *Shell) Run() {
 		}
 
 		s.interruptCount = 0
-		rl.SetPrompt(fmt.Sprintf("%s $ ", s.currentDir))
+		rl.SetPrompt(s.getPrompt())
 	}
 
 	s.saveHistory()
 }
 
+func (s *Shell) getPrompt() string {
+	return fmt.Sprintf("%s $ ", s.currentDir)
+}
+
 func (s *Shell) executeCommand(input string) error {
+	// Expand variables
+	for k, v := range s.variables {
+		input = strings.ReplaceAll(input, "$"+k, v)
+	}
+
 	parts, err := shellquote.Split(input)
 	if err != nil {
 		return fmt.Errorf("error parsing command: %w", err)
@@ -106,6 +132,15 @@ func (s *Shell) executeCommand(input string) error {
 
 	if len(parts) == 0 {
 		return nil
+	}
+
+	// Check for aliases
+	if alias, ok := s.aliases[parts[0]]; ok {
+		aliasParts, err := shellquote.Split(alias)
+		if err != nil {
+			return fmt.Errorf("error parsing alias: %w", err)
+		}
+		parts = append(aliasParts, parts[1:]...)
 	}
 
 	switch parts[0] {
@@ -119,22 +154,78 @@ func (s *Shell) executeCommand(input string) error {
 		return s.changeDirectory(parts)
 	case "export":
 		return s.exportVar(parts)
+	case "alias":
+		return s.setAlias(parts)
+	case "jobs":
+		s.listJobs()
+		return nil
+	case "fg":
+		return s.foregroundJob(parts)
+	case "bg":
+		return s.backgroundJob(parts)
+	case "set":
+		return s.setVariable(parts)
 	}
 
 	return s.runExternal(parts)
 }
 
 func (s *Shell) runExternal(parts []string) error {
+	background := false
+	if parts[len(parts)-1] == "&" {
+		background = true
+		parts = parts[:len(parts)-1]
+	}
+
 	cmd := exec.Command(parts[0], parts[1:]...)
 	cmd.Env = os.Environ()
 	for k, v := range s.env {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
+
+	if background {
+		cmd.Stdin = nil
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		job := &Job{
+			cmd:      cmd,
+			status:   "Running",
+			jobID:    s.nextJobID,
+			stopChan: make(chan struct{}),
+		}
+		s.jobs[s.nextJobID] = job
+		s.nextJobID++
+		fmt.Printf("[%d] %d\n", job.jobID, cmd.Process.Pid)
+		go s.waitForJob(job)
+		return nil
+	}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	return cmd.Run()
+}
+
+func (s *Shell) waitForJob(job *Job) {
+	err := job.cmd.Wait()
+	select {
+	case <-job.stopChan:
+		return
+	default:
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				job.status = fmt.Sprintf("Exited (%d)", exitErr.ExitCode())
+			} else {
+				job.status = "Errored"
+			}
+		} else {
+			job.status = "Done"
+		}
+		fmt.Printf("[%d]+ %s\t%s\n", job.jobID, job.status, job.cmd.Args[0])
+	}
 }
 
 func (s *Shell) changeDirectory(parts []string) error {
@@ -163,6 +254,113 @@ func (s *Shell) exportVar(parts []string) error {
 	}
 	s.env[kv[0]] = kv[1]
 	return nil
+}
+
+func (s *Shell) setAlias(parts []string) error {
+	if len(parts) != 2 {
+		return fmt.Errorf("alias: invalid syntax")
+	}
+	kv := strings.SplitN(parts[1], "=", 2)
+	if len(kv) != 2 {
+		return fmt.Errorf("alias: invalid syntax")
+	}
+	s.aliases[kv[0]] = kv[1]
+	return nil
+}
+
+func (s *Shell) listJobs() {
+	for _, job := range s.jobs {
+		fmt.Printf("[%d] %s\t%s\n", job.jobID, job.status, job.cmd.Args[0])
+	}
+}
+
+func (s *Shell) foregroundJob(parts []string) error {
+	if len(parts) != 2 {
+		return fmt.Errorf("fg: invalid syntax")
+	}
+	jobID := 0
+	_, err := fmt.Sscanf(parts[1], "%d", &jobID)
+	if err != nil {
+		return fmt.Errorf("fg: invalid job ID")
+	}
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return fmt.Errorf("fg: job not found")
+	}
+	delete(s.jobs, jobID)
+	close(job.stopChan)
+
+	job.cmd.Stdin = os.Stdin
+	job.cmd.Stdout = os.Stdout
+	job.cmd.Stderr = os.Stderr
+
+	err = job.cmd.Wait()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			fmt.Printf("Exited (%d)\n", exitErr.ExitCode())
+		} else {
+			fmt.Printf("Error: %v\n", err)
+		}
+	}
+	return nil
+}
+
+func (s *Shell) backgroundJob(parts []string) error {
+	if len(parts) != 2 {
+		return fmt.Errorf("bg: invalid syntax")
+	}
+	jobID := 0
+	_, err := fmt.Sscanf(parts[1], "%d", &jobID)
+	if err != nil {
+		return fmt.Errorf("bg: invalid job ID")
+	}
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return fmt.Errorf("bg: job not found")
+	}
+	if job.status != "Stopped" {
+		return fmt.Errorf("bg: job is not stopped")
+	}
+	job.status = "Running"
+	job.cmd.Process.Signal(syscall.SIGCONT)
+	return nil
+}
+
+func (s *Shell) setVariable(parts []string) error {
+	if len(parts) != 2 {
+		return fmt.Errorf("set: invalid syntax")
+	}
+	kv := strings.SplitN(parts[1], "=", 2)
+	if len(kv) != 2 {
+		return fmt.Errorf("set: invalid syntax")
+	}
+	s.variables[kv[0]] = kv[1]
+	return nil
+}
+
+func (s *Shell) handleSignals() {
+	for sig := range s.signalChan {
+		switch sig {
+		case syscall.SIGINT:
+			// Handle Ctrl+C
+			fmt.Println("\nInterrupted")
+		case syscall.SIGTSTP:
+			// Handle Ctrl+Z
+			fmt.Println("\nStopped")
+		case syscall.SIGCHLD:
+			// Handle child process status changes
+			s.reapChildren()
+		}
+	}
+}
+
+func (s *Shell) reapChildren() {
+	for {
+		pid, _ := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
+		if pid <= 0 {
+			break
+		}
+	}
 }
 
 func (s *Shell) addToHistory(command string) {
