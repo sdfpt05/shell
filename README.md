@@ -1,13 +1,13 @@
-# shell
+# MyShell
 
-This is a basic shell implementation written in Go.
+MyShell is a customizable shell written in Go.
 
 ## Features
 
-- Execute shell commands
-- Support for command piping
-- Built-in commands: `cd`, `history`, `exit`
-- Persistent command history
-- Ctrl+C handling (press twice to exit)
+- Customizable prompt and aliases
+- Job control (background jobs, fg, bg commands)
+- Plugin system for easy extensibility
+- Cross-platform support (Windows, macOS, Linux)
+- Comprehensive test suite
 
 This is one of the John Cricket's Coding Challenges solutions https://codingchallenges.fyi/challenges/challenge-shell/
