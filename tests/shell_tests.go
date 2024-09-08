@@ -1,8 +1,8 @@
 package tests
 
 import (
-	"myshell/internal/config"
-	"myshell/internal/shell"
+	"shell/internal/config"
+	"shell/internal/shell"
 	"testing"
 )
 

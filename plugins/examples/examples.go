@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"myshell/internal/plugin"
+	"shell/internal/plugin"
 )
 
 type ExamplePlugin struct{}
