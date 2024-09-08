@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/chzyer/readline"
+	"github.com/kballard/go-shellquote"
 )
 
 const (
@@ -23,6 +26,7 @@ type Shell struct {
 	currentDir     string
 	signalChan     chan os.Signal
 	interruptCount int
+	env            map[string]string
 }
 
 func NewShell() (*Shell, error) {
@@ -47,6 +51,7 @@ func NewShell() (*Shell, error) {
 		historyFile: historyFile,
 		currentDir:  currentDir,
 		signalChan:  make(chan os.Signal, 1),
+		env:         make(map[string]string),
 	}, nil
 }
 
@@ -54,126 +59,89 @@ func (s *Shell) Run() {
 	signal.Notify(s.signalChan, syscall.SIGINT)
 	defer signal.Stop(s.signalChan)
 
-	reader := bufio.NewReader(os.Stdin)
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:      fmt.Sprintf("%s $ ", s.currentDir),
+		HistoryFile: s.historyFile,
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer rl.Close()
 
 	for {
-		fmt.Printf("%s $ ", s.currentDir)
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+		line, err := rl.Readline()
+		if err == readline.ErrInterrupt {
+			if s.interruptCount++; s.interruptCount >= 2 {
+				fmt.Println("\nForced exit")
+				break
+			}
+			continue
+		} else if err == io.EOF {
+			break
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
 
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
-		}
+		s.addToHistory(line)
 
-		s.addToHistory(input)
-
-		if err := s.executeCommand(input); err != nil {
+		if err := s.executeCommand(line); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 
 		s.interruptCount = 0
+		rl.SetPrompt(fmt.Sprintf("%s $ ", s.currentDir))
 	}
+
+	s.saveHistory()
 }
 
 func (s *Shell) executeCommand(input string) error {
-	commands := strings.Split(input, "|")
-	var cmds []*exec.Cmd
-	var inputPipe io.Reader = os.Stdin
-
-	for i, command := range commands {
-		command = strings.TrimSpace(command)
-		parts := strings.Fields(command)
-		if len(parts) == 0 {
-			continue
-		}
-
-		switch parts[0] {
-		case "exit":
-			s.saveHistory()
-			os.Exit(0)
-		case "history":
-			s.printHistory()
-			return nil
-		case "cd":
-			return s.changeDirectory(parts)
-		}
-
-		cmd := exec.Command(parts[0], parts[1:]...)
-		cmd.Stdin = inputPipe
-		cmd.Stderr = os.Stderr
-
-		if i < len(commands)-1 {
-			outputPipe, err := cmd.StdoutPipe()
-			if err != nil {
-				return fmt.Errorf("error creating stdout pipe: %w", err)
-			}
-			inputPipe = outputPipe
-		} else {
-			cmd.Stdout = os.Stdout
-		}
-
-		cmds = append(cmds, cmd)
+	parts, err := shellquote.Split(input)
+	if err != nil {
+		return fmt.Errorf("error parsing command: %w", err)
 	}
 
-	return s.runCommands(cmds)
+	if len(parts) == 0 {
+		return nil
+	}
+
+	switch parts[0] {
+	case "exit":
+		s.saveHistory()
+		os.Exit(0)
+	case "history":
+		s.printHistory()
+		return nil
+	case "cd":
+		return s.changeDirectory(parts)
+	case "export":
+		return s.exportVar(parts)
+	}
+
+	return s.runExternal(parts)
 }
 
-func (s *Shell) runCommands(cmds []*exec.Cmd) error {
-	for _, cmd := range cmds {
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("error starting command: %w", err)
-		}
+func (s *Shell) runExternal(parts []string) error {
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Env = os.Environ()
+	for k, v := range s.env {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-	done := make(chan error, len(cmds))
-	for _, cmd := range cmds {
-		go func(cmd *exec.Cmd) {
-			done <- cmd.Wait()
-		}(cmd)
-	}
-
-	go s.handleSignals(cmds)
-
-	for range cmds {
-		if err := <-done; err != nil {
-			return fmt.Errorf("error waiting for command: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (s *Shell) handleSignals(cmds []*exec.Cmd) {
-	for sig := range s.signalChan {
-		if sig == syscall.SIGINT {
-			s.interruptCount++
-			if s.interruptCount >= 2 {
-				fmt.Println("\nForced exit")
-				s.saveHistory()
-				os.Exit(1)
-			}
-			fmt.Println("\nPress Ctrl+C again to exit")
-			for _, cmd := range cmds {
-				if cmd.Process != nil {
-					_ = cmd.Process.Signal(sig)
-				}
-			}
-		}
-	}
+	return cmd.Run()
 }
 
 func (s *Shell) changeDirectory(parts []string) error {
 	if len(parts) < 2 {
 		return fmt.Errorf("cd: missing argument")
 	}
-	if len(parts) > 2 {
-		return fmt.Errorf("cd: too many arguments")
-	}
-	path := parts[1]
+	path := os.ExpandEnv(parts[1])
 	if err := os.Chdir(path); err != nil {
 		return fmt.Errorf("cd: %s: %w", path, err)
 	}
@@ -182,6 +150,18 @@ func (s *Shell) changeDirectory(parts []string) error {
 	if err != nil {
 		return fmt.Errorf("error getting current directory: %w", err)
 	}
+	return nil
+}
+
+func (s *Shell) exportVar(parts []string) error {
+	if len(parts) != 2 {
+		return fmt.Errorf("export: invalid syntax")
+	}
+	kv := strings.SplitN(parts[1], "=", 2)
+	if len(kv) != 2 {
+		return fmt.Errorf("export: invalid syntax")
+	}
+	s.env[kv[0]] = kv[1]
 	return nil
 }
 
